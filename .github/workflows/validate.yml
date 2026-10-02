@@ -1,0 +1,20 @@
+name: validate
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install cfn-lint
+      - name: Embedded app matches app/app.py
+        run: |
+          python3 scripts/embed_app.py
+          git diff --exit-code infrastructure/main.yaml
+      - name: Lint CloudFormation
+        run: cfn-lint infrastructure/main.yaml
+      - name: Lint shell scripts
+        run: shellcheck -x -e SC1091 scripts/*.sh
+      - name: Compile application
+        run: python3 -m py_compile app/app.py

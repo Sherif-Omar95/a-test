@@ -132,7 +132,7 @@ Prerequisites: an AWS account, AWS CLI v2 configured, Bash, Python 3.
 git clone https://github.com/Sherif-Omar95/a-test.git
 cd a-test
 export AWS_REGION=us-east-1
-ALERT_EMAIL=you@example.com ./scripts/deploy.sh
+ALERT_EMAIL=sherifabdelaziz18.com ./scripts/deploy.sh
 ```
 
 The first deployment takes 20 to 30 minutes, mostly RDS Multi-AZ and CloudFront. When it finishes the script prints the stack outputs and the application URL. Confirm the SNS subscription email to receive alarms.

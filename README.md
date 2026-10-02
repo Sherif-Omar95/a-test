@@ -1,7 +1,7 @@
 # Scalable Web Application with ALB and Auto Scaling
 
 AWS Solutions Architect – Associate graduation project (Project 1).
-Author: **Sherif Omar**
+Author: **Sherif Abdelaziz**
 
 A highly available web application on Amazon EC2. Instances run in an Auto Scaling group behind an Application Load Balancer, spread across two Availability Zones, and share a Multi-AZ Amazon RDS for MySQL database. CloudFront is the single public entry point: it serves static files from a private S3 bucket and forwards everything else to the load balancer, which is protected by AWS WAF.
 

@@ -1,0 +1,1168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Scalable Web Application with ALB and Auto Scaling. Multi-AZ VPC, EC2 Auto
+  Scaling group behind an Application Load Balancer, RDS MySQL Multi-AZ,
+  CloudFront with S3 static assets, WAF, CloudWatch alarms and SNS.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: General }
+        Parameters: [ProjectName, AlertEmail]
+      - Label: { default: Network }
+        Parameters: [NatGatewayMode]
+      - Label: { default: Compute and scaling }
+        Parameters: [InstanceType, LatestAmiId, MinSize, MaxSize, DesiredCapacity, CpuTargetPercent, RequestsPerTarget]
+      - Label: { default: Database }
+        Parameters: [DBInstanceClass, DBEngineVersion, DBMultiAZ, DBAllocatedStorage]
+      - Label: { default: Optional custom domain (leave all three empty to skip) }
+        Parameters: [DomainName, HostedZoneId, CloudFrontCertificateArn]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: scalable-web
+    AllowedPattern: "^[a-z][a-z0-9-]{2,20}$"
+    Description: Prefix for resource names (lowercase, 3-21 characters).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address for alarm notifications. Confirm the subscription email after deploy.
+  NatGatewayMode:
+    Type: String
+    Default: single
+    AllowedValues: [single, per-az]
+    Description: single = one NAT Gateway (cheaper). per-az = one per AZ (no cross-AZ dependency).
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    Description: At least 2 so both Availability Zones always have an instance.
+  MaxSize:
+    Type: Number
+    Default: 6
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+  CpuTargetPercent:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 90
+  RequestsPerTarget:
+    Type: Number
+    Default: 1000
+    Description: Target ALB requests per instance per minute.
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t4g.micro, db.t4g.small]
+  DBEngineVersion:
+    Type: String
+    Default: "8.4"
+    AllowedValues: ["8.4", "8.0"]
+    Description: MySQL major version. 8.0 is past standard support and adds RDS Extended Support charges.
+  DBMultiAZ:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional, e.g. app.example.com
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Optional Route 53 hosted zone ID for DomainName.
+  CloudFrontCertificateArn:
+    Type: String
+    Default: ""
+    Description: Optional ACM certificate ARN in us-east-1 covering DomainName.
+
+Conditions:
+  PerAzNat: !Equals [!Ref NatGatewayMode, per-az]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  UseCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+    - !Not [!Equals [!Ref CloudFrontCertificateArn, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-igw" }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-a" }]
+
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-b" }]
+
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.20.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-data-a" }]
+
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-data-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-rt" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-nat-a" }]
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-nat-a" }]
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: PerAzNat
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-nat-b" }]
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: PerAzNat
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-nat-b" }]
+
+  AppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-rt-a" }]
+
+  AppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-rt-b" }]
+
+  AppDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  AppDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [PerAzNat, !Ref NatGatewayB, !Ref NatGatewayA]
+
+  AppSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      RouteTableId: !Ref AppRouteTableA
+
+  AppSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      RouteTableId: !Ref AppRouteTableB
+
+  # Data subnets get a route table with only the implicit local route:
+  # the database tier has no path to or from the internet.
+  DataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-data-rt" }]
+
+  DataSubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetA
+      RouteTableId: !Ref DataRouteTable
+
+  DataSubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetB
+      RouteTableId: !Ref DataRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRouteTableA, !Ref AppRouteTableB]
+
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/vpc-flow-logs"
+      RetentionInDays: 14
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: REJECT
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+
+  # ------------------------------------------------------- security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from CloudFront (WAF rejects anything that bypasses CloudFront)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-alb-sg" }]
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web instances - HTTP from the ALB only, no SSH
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-sg" }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - MySQL from web instances only, no outbound
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: MySQL from web tier
+      # Replaces the default allow-all egress rule with one that matches nothing.
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: 252, ToPort: 86, CidrIp: 127.0.0.1/32, Description: no outbound }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-sg" }]
+
+  # -------------------------------------------------------------- database
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Isolated data subnets in two AZs
+      SubnetIds: [!Ref DataSubnetA, !Ref DataSubnetB]
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Enforce TLS for every client connection
+      Family: !Sub "mysql${DBEngineVersion}"
+      Parameters:
+        require_secure_transport: "1"
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-mysql"
+      Engine: mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !Ref DBMultiAZ
+      DBName: appdb
+      MasterUsername: dbadmin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+  # --------------------------------------------------------------- compute
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-web"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        Monitoring: { Enabled: true }
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web" }]
+          - ResourceType: volume
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web" }]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee -a /var/log/user-data.log) 2>&1
+              signal() {
+                /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} \
+                  --resource AppAutoScalingGroup --region ${AWS::Region} || true
+              }
+              trap 'signal 1' ERR
+
+              dnf install -y python3-pip aws-cfn-bootstrap
+              pip3 install --quiet pymysql boto3
+              id webapp >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin webapp
+              mkdir -p /opt/webapp
+              curl -fsSL -o /opt/webapp/rds-ca.pem \
+                https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
+              cat > /opt/webapp/app.py <<'APP'
+              # >>> app/app.py (inserted by scripts/embed_app.py)
+              #!/usr/bin/env python3
+              """Demo web tier for the Scalable Web Application project.
+
+              Every page view is written to the shared Multi-AZ RDS database, so the page
+              shows which instance and Availability Zone answered each recent request.
+
+              Endpoints
+                /           HTML page: this instance, shared request log, database status
+                /api/info   the same data as JSON
+                /health     ALB health check; never touches the database
+              """
+              import html
+              import json
+              import os
+              import socket
+              import time
+              import urllib.request
+              from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+              import boto3
+              import pymysql
+
+              DB_HOST = os.environ["DB_HOST"]
+              DB_NAME = os.environ.get("DB_NAME", "appdb")
+              DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
+              REGION = os.environ["AWS_REGION"]
+              CA_BUNDLE = "/opt/webapp/rds-ca.pem"
+              PORT = int(os.environ.get("PORT", "80"))
+
+
+              def imds(path):
+                  """Read instance metadata with IMDSv2 (session token required)."""
+                  try:
+                      req = urllib.request.Request(
+                          "http://169.254.169.254/latest/api/token", method="PUT",
+                          headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+                      token = urllib.request.urlopen(req, timeout=2).read().decode()
+                      req = urllib.request.Request(
+                          "http://169.254.169.254/latest/meta-data/" + path,
+                          headers={"X-aws-ec2-metadata-token": token})
+                      return urllib.request.urlopen(req, timeout=2).read().decode()
+                  except Exception:
+                      return "unknown"
+
+
+              INSTANCE = {
+                  "instance_id": imds("instance-id"),
+                  "az": imds("placement/availability-zone"),
+                  "private_ip": imds("local-ipv4"),
+                  "instance_type": imds("instance-type"),
+              }
+
+              _secret = {"value": None, "fetched": 0.0}
+
+
+              def db_credentials():
+                  """RDS-managed secret, cached for 5 minutes so rotation is picked up."""
+                  if _secret["value"] is None or time.time() - _secret["fetched"] > 300:
+                      sm = boto3.client("secretsmanager", region_name=REGION)
+                      raw = sm.get_secret_value(SecretId=DB_SECRET_ARN)["SecretString"]
+                      _secret["value"] = json.loads(raw)
+                      _secret["fetched"] = time.time()
+                  return _secret["value"]
+
+
+              def connect():
+                  creds = db_credentials()
+                  return pymysql.connect(
+                      host=DB_HOST, user=creds["username"], password=creds["password"],
+                      database=DB_NAME, connect_timeout=3, read_timeout=5,
+                      ssl={"ca": CA_BUNDLE}, autocommit=True)
+
+
+              def record_visit(path):
+                  """Log this request and return the shared view of the database."""
+                  result = {"ok": False}
+                  try:
+                      conn = connect()
+                      with conn.cursor() as cur:
+                          cur.execute(
+                              "CREATE TABLE IF NOT EXISTS visits ("
+                              " id BIGINT AUTO_INCREMENT PRIMARY KEY,"
+                              " instance_id VARCHAR(32), az VARCHAR(32), path VARCHAR(255),"
+                              " created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3))")
+                          cur.execute(
+                              "INSERT INTO visits (instance_id, az, path) VALUES (%s,%s,%s)",
+                              (INSTANCE["instance_id"], INSTANCE["az"], path[:255]))
+                          cur.execute("SELECT COUNT(*) FROM visits")
+                          result["total"] = cur.fetchone()[0]
+                          cur.execute(
+                              "SELECT az, COUNT(*) FROM visits GROUP BY az ORDER BY az")
+                          result["by_az"] = {az: n for az, n in cur.fetchall()}
+                          cur.execute(
+                              "SELECT instance_id, az, created_at FROM visits"
+                              " ORDER BY id DESC LIMIT 10")
+                          result["recent"] = [
+                              {"instance_id": i, "az": a, "at": t.strftime("%H:%M:%S")}
+                              for i, a, t in cur.fetchall()]
+                          cur.execute("SELECT @@hostname, VERSION()")
+                          result["db_host"], result["db_version"] = cur.fetchone()
+                          cur.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+                          row = cur.fetchone()
+                          result["tls_cipher"] = row[1] if row and row[1] else "none"
+                      conn.close()
+                      result["ok"] = True
+                  except Exception as exc:  # the page still renders without the database
+                      result["error"] = type(exc).__name__ + ": " + str(exc)[:200]
+                  return result
+
+
+              PAGE = """<!doctype html>
+              <html lang="en"><head><meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Served from {az}</title>
+              <link rel="stylesheet" href="/static/style.css">
+              <link rel="icon" href="/static/favicon.svg">
+              </head><body>
+              <main>
+              <header>
+              <p class="lede">This request was answered by</p>
+              <h1>{instance_id}</h1>
+              <p class="where">in <strong>{az}</strong>, private address {private_ip}, {instance_type}</p>
+              <p class="hint">Refresh the page. The load balancer spreads requests across healthy
+              instances in both Availability Zones, so the answer changes.</p>
+              </header>
+              {db_section}
+              <footer>Path: CloudFront, WAF, Application Load Balancer, Auto Scaling group,
+              RDS MySQL Multi-AZ. Styles on this page come from S3 through CloudFront.</footer>
+              </main></body></html>"""
+
+
+              def render(data):
+                  esc = {k: html.escape(str(v)) for k, v in INSTANCE.items()}
+                  if not data["ok"]:
+                      db = ("<section class='db error'><h2>Database unreachable</h2>"
+                            "<p>The web tier is healthy, but this instance could not reach "
+                            "RDS: <code>{}</code>. During a Multi-AZ failover this clears "
+                            "within about two minutes.</p></section>"
+                            ).format(html.escape(data.get("error", "")))
+                      return PAGE.format(db_section=db, **esc)
+                  bars = "".join(
+                      "<li><span class='az'>{}</span><span class='n'>{}</span></li>".format(
+                          html.escape(az), n) for az, n in data["by_az"].items())
+                  rows = "".join(
+                      "<tr class='{}'><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                          "self" if r["instance_id"] == INSTANCE["instance_id"] else "",
+                          r["at"], html.escape(r["instance_id"]), html.escape(r["az"]))
+                      for r in data["recent"])
+                  db = ("<section class='db'>"
+                        "<h2>Shared request log</h2>"
+                        "<p>Every instance writes to the same database, so this log shows "
+                        "requests answered by all of them. Rows from this instance are "
+                        "highlighted.</p>"
+                        "<table><thead><tr><th>Time (UTC)</th><th>Instance</th><th>Zone</th>"
+                        "</tr></thead><tbody>{rows}</tbody></table>"
+                        "<h3>{total} requests in total, by zone</h3><ul class='split'>{bars}</ul>"
+                        "<p class='meta'>Database server {host}, MySQL {ver}, "
+                        "TLS cipher {tls}</p></section>").format(
+                            rows=rows, total=data["total"], bars=bars,
+                            host=html.escape(str(data["db_host"])),
+                            ver=html.escape(str(data["db_version"])),
+                            tls=html.escape(str(data["tls_cipher"])))
+                  return PAGE.format(db_section=db, **esc)
+
+
+              class Handler(BaseHTTPRequestHandler):
+                  server_version = "webapp"
+
+                  def send(self, code, body, ctype):
+                      payload = body.encode()
+                      self.send_response(code)
+                      self.send_header("Content-Type", ctype)
+                      self.send_header("Content-Length", str(len(payload)))
+                      self.send_header("Cache-Control", "no-store")
+                      self.send_header("X-Served-By", INSTANCE["instance_id"])
+                      self.end_headers()
+                      self.wfile.write(payload)
+
+                  def do_GET(self):
+                      path = self.path.split("?")[0]
+                      if path == "/health":
+                          self.send(200, "ok\n", "text/plain")
+                      elif path == "/api/info":
+                          data = record_visit(path)
+                          data["instance"] = INSTANCE
+                          data["hostname"] = socket.gethostname()
+                          self.send(200, json.dumps(data, default=str, indent=2),
+                                    "application/json")
+                      elif path == "/":
+                          self.send(200, render(record_visit(path)),
+                                    "text/html; charset=utf-8")
+                      else:
+                          self.send(404, "not found\n", "text/plain")
+
+                  def log_message(self, fmt, *args):
+                      pass  # the ALB access path is already observable in CloudWatch
+
+
+              if __name__ == "__main__":
+                  ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+              # <<< app/app.py
+              APP
+
+              cat > /etc/webapp.env <<ENV
+              DB_HOST=${DbHost}
+              DB_NAME=appdb
+              DB_SECRET_ARN=${DbSecretArn}
+              AWS_REGION=${AWS::Region}
+              ENV
+
+              cat > /etc/systemd/system/webapp.service <<'UNIT'
+              [Unit]
+              Description=Demo web application
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              User=webapp
+              EnvironmentFile=/etc/webapp.env
+              ExecStart=/usr/bin/python3 /opt/webapp/app.py
+              Restart=always
+              RestartSec=2
+              AmbientCapabilities=CAP_NET_BIND_SERVICE
+              NoNewPrivileges=true
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+
+              systemctl daemon-reload
+              systemctl enable --now webapp
+              for attempt in $(seq 1 30); do
+                curl -fs http://127.0.0.1/health && break
+                sleep 2
+              done
+              curl -fs http://127.0.0.1/health
+              signal 0
+            - DbHost: !GetAtt Database.Endpoint.Address
+              DbSecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [AppDefaultRouteA, AppDefaultRouteB, AppSubnetARouteTable, AppSubnetBRouteTable]
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-web", PropagateAtLaunch: true }
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 180
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuTargetPercent
+
+  RequestScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 180
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Join
+            - /
+            - [!GetAtt LoadBalancer.LoadBalancerFullName, !GetAtt TargetGroup.TargetGroupFullName]
+        TargetValue: !Ref RequestsPerTarget
+
+  # ---------------------------------------------------------- load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+        - { Key: idle_timeout.timeout_seconds, Value: "60" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  AdminBlockRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/admin*"] }
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "403"
+            ContentType: text/plain
+            MessageBody: Forbidden at the load balancer
+
+  # ------------------------------------------------------------------- WAF
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-alb-acl"
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-alb-acl"
+      Rules:
+        - Name: require-cloudfront-origin-header
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            NotStatement:
+              Statement:
+                ByteMatchStatement:
+                  FieldToMatch: { SingleHeader: { Name: x-origin-verify } }
+                  PositionalConstraint: EXACTLY
+                  SearchString: !Select [2, !Split ["/", !Ref AWS::StackId]]
+                  TextTransformations: [{ Priority: 0, Type: NONE }]
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: bypassed-cloudfront
+        - Name: rate-limit-per-client-ip
+          Priority: 1
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: FORWARDED_IP
+              ForwardedIPConfig:
+                HeaderName: X-Forwarded-For
+                FallbackBehavior: MATCH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limited
+        - Name: aws-common
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-common
+        - Name: aws-sqli
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-sqli
+        - Name: aws-known-bad-inputs
+          Priority: 4
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-known-bad-inputs
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # ------------------------------------------------- S3 static + CloudFront
+  StaticBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${AWS::Region}-static-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  StaticBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudFrontReadOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${StaticBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt StaticBucket.Arn, !Sub "${StaticBucket.Arn}/*"]
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} - dynamic from ALB, /static/* from S3"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Aliases: !If [UseCustomDomain, [!Ref DomainName], !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - AcmCertificateArn: !Ref CloudFrontCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+            OriginCustomHeaders:
+              - HeaderName: x-origin-verify
+                HeaderValue: !Select [2, !Split ["/", !Ref AWS::StackId]]
+          - Id: static
+            DomainName: !GetAtt StaticBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+        CacheBehaviors:
+          - PathPattern: static/*
+            TargetOriginId: static
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6        # Managed-CachingOptimized
+
+  DnsRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2   # fixed zone ID for every CloudFront distribution
+
+  DnsRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  # ------------------------------------------------------------ monitoring
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlarmHighCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-web-cpu-high"
+      AlarmDescription: Web tier CPU stays above 80% even after scaling (check MaxSize)
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !Ref AppAutoScalingGroup }]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 10
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  AlarmUnhealthyHosts:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-unhealthy-targets"
+      AlarmDescription: At least one instance is failing the /health check
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  AlarmTarget5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-target-5xx"
+      AlarmDescription: Instances returned more than 10 server errors in 5 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  AlarmDbCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-db-cpu-high"
+      AlarmDescription: RDS CPU above 80% for 10 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  AlarmDbStorage:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-db-storage-low"
+      AlarmDescription: Less than 2 GiB of free database storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-overview"
+      DashboardBody: !Sub
+        - |
+          {"widgets":[
+           {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests through the ALB","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Alb}"],[".","HTTPCode_Target_5XX_Count",".","."]]}},
+           {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Target response time (p95, seconds)","region":"${AWS::Region}","stat":"p95","period":60,
+            "metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${Alb}"]]}},
+           {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Web tier CPU and instance count","region":"${AWS::Region}","period":60,
+            "metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${Asg}",{"stat":"Average"}],
+                       ["AWS/AutoScaling","GroupInServiceInstances","AutoScalingGroupName","${Asg}",{"stat":"Maximum","yAxis":"right"}]]}},
+           {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Healthy and unhealthy targets","region":"${AWS::Region}","stat":"Maximum","period":60,
+            "metrics":[["AWS/ApplicationELB","HealthyHostCount","LoadBalancer","${Alb}","TargetGroup","${Tg}"],[".","UnHealthyHostCount",".",".",".","."]]}},
+           {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Database CPU and connections","region":"${AWS::Region}","stat":"Average","period":60,
+            "metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Db}"],[".","DatabaseConnections",".",".",{"yAxis":"right"}]]}},
+           {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"WAF allowed and blocked requests","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/WAFV2","AllowedRequests","WebACL","${Acl}","Region","${AWS::Region}","Rule","ALL"],[".","BlockedRequests",".",".",".",".",".","."]]}}
+          ]}
+        - Alb: !GetAtt LoadBalancer.LoadBalancerFullName
+          Tg: !GetAtt TargetGroup.TargetGroupFullName
+          Asg: !Ref AppAutoScalingGroup
+          Db: !Ref Database
+          Acl: !Sub "${ProjectName}-alb-acl"
+
+Outputs:
+  ApplicationUrl:
+    Description: Open this in a browser
+    Value: !If
+      - UseCustomDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${Distribution.DomainName}"
+  CloudFrontDomain:
+    Value: !GetAtt Distribution.DomainName
+  CloudFrontDistributionId:
+    Value: !Ref Distribution
+  AlbDnsName:
+    Description: Direct requests here return 403 from WAF (origin is locked to CloudFront)
+    Value: !GetAtt LoadBalancer.DNSName
+  AutoScalingGroupName:
+    Value: !Ref AppAutoScalingGroup
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  DatabaseIdentifier:
+    Value: !Ref Database
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  StaticBucketName:
+    Value: !Ref StaticBucket
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-overview"

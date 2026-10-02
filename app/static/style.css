@@ -1,0 +1,53 @@
+/* Served from S3 through CloudFront (/static/*), not from the EC2 instances. */
+@import url("https://fonts.googleapis.com/css2?family=Barlow:wght@400;600&family=Barlow+Condensed:wght@600&display=swap");
+
+:root {
+  --ground: #e9eef2;
+  --paper: #ffffff;
+  --ink: #18242f;
+  --muted: #5d6b78;
+  --zone-a: #2f6c99;
+  --zone-b: #b97a1e;
+  --line: #cfd8e0;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 400 1.0625rem/1.55 "Barlow", "Segoe UI", system-ui, sans-serif;
+}
+main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 4rem; }
+header { border-left: 6px solid var(--zone-a); padding-left: 1.25rem; }
+.lede { margin: 0; color: var(--muted); }
+h1 {
+  margin: .1rem 0 .25rem;
+  font: 600 clamp(2.2rem, 7vw, 3.6rem)/1.05 "Barlow Condensed", "Arial Narrow", sans-serif;
+  letter-spacing: -.01em;
+  overflow-wrap: anywhere;
+}
+.where { margin: 0 0 1rem; font-size: 1.15rem; }
+.hint { margin: 0; color: var(--muted); max-width: 36rem; }
+.db {
+  margin-top: 2.5rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 1.5rem;
+}
+.db.error { border-color: #b3402e; }
+h2 { margin: 0 0 .25rem; font-size: 1.3rem; }
+h3 { margin: 1.5rem 0 .5rem; font-size: 1rem; }
+.db > p { margin: 0 0 1rem; color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid var(--line); }
+th { font-weight: 600; color: var(--muted); }
+tr.self td { background: #e3edf5; }
+.split { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: .5rem; }
+.split li { display: flex; gap: .75rem; padding: .4rem .75rem; border: 1px solid var(--line); }
+.split li:nth-child(1) { border-left: 4px solid var(--zone-a); }
+.split li:nth-child(2) { border-left: 4px solid var(--zone-b); }
+.split .n { font-weight: 600; }
+.meta { margin: 1.25rem 0 0 !important; font-size: .9rem; }
+code { overflow-wrap: anywhere; }
+footer { margin-top: 2rem; font-size: .9rem; color: var(--muted); }
+@media (max-width: 30rem) { th:nth-child(3), td:nth-child(3) { display: none; } }
